@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>8x8 Grid ArUco Scanner</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:#f5f5f5;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;font-family:monospace;padding:20px;}
+#main{display:flex;align-items:flex-start;gap:16px;}
+#wrap{position:relative;display:inline-block;flex-shrink:0;}
+#minimap{position:absolute;top:10px;left:10px;border:1px solid rgba(255,255,255,0.3);border-radius:4px;background:rgba(0,0,0,0.6);}
+#det{position:absolute;top:0;left:0;pointer-events:none;border-radius:8px;}
+#right{display:flex;flex-direction:column;gap:10px;padding-top:10px;width:200px;}
+#panel{display:flex;flex-direction:column;gap:5px;}
+.pr{display:flex;align-items:flex-start;gap:7px;}
+.pi{font-size:11px;color:#888;min-width:16px;text-align:right;padding-top:5px;}
+.pb{width:26px;height:26px;border-radius:5px;background:#E02020;color:#fff;font-size:14px;font-weight:bold;display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.ni{font-size:9px;color:#777;line-height:1.5;background:#f0f0f0;border-radius:3px;padding:2px 5px;border-left:2px solid #ccc;}
+#gmapSection{display:flex;flex-direction:column;gap:4px;}
+.section-label{font-size:11px;color:#888;font-weight:bold;border-bottom:1px solid #ddd;padding-bottom:3px;margin-bottom:2px;}
+#gmap{border:1px solid #bbb;border-radius:4px;display:block;background:#fff;width:180px;height:180px;}
+#graphStats{font-size:10px;color:#666;text-align:center;padding:2px 0;}
+#pathSection{display:flex;flex-direction:column;gap:6px;}
+.path-btns{display:flex;gap:5px;}
+.path-btns button{font-size:11px;padding:4px 10px;border:1px solid #ccc;background:#fff;border-radius:4px;cursor:pointer;}
+.path-btns button:hover{background:#eee;}
+button.active-astar{background:#1a6aff;color:#fff;border-color:#1055cc;}
+button.active-dijkstra{background:#e06000;color:#fff;border-color:#b04800;}
+#pathInfo{font-size:10px;color:#444;min-height:14px;background:#f9f9f9;border-radius:3px;padding:3px 5px;}
+#ctrl{display:flex;align-items:center;gap:12px;padding:12px 0 0;flex-wrap:wrap;}
+#ctrl label{font-size:13px;color:#555;}
+#ctrl button{padding:6px 16px;font-size:13px;cursor:pointer;border:1px solid #ccc;background:#fff;border-radius:4px;}
+#ctrl button:hover{background:#eee;}
+#ctrl input[type=range]{flex:1;max-width:140px;}
+#status{font-size:13px;color:#555;padding:6px 0 0;}
+#detBtn.on{background:#1a6aff;color:#fff;border-color:#1055cc;}
+</style>
+</head>
+<body>
+<div id="main">
+  <div id="wrap">
+    <canvas id="c" width="500" height="500" style="display:block;border:1px solid #ddd;border-radius:8px;background:#fff;"></canvas>
+    <canvas id="det" width="500" height="500"></canvas>
+    <canvas id="minimap" width="110" height="110"></canvas>
+  </div>
+  <div id="right">
+    <div id="panel"></div>
+    <div id="gmapSection">
+      <div class="section-label">Graph Map</div>
+      <canvas id="gmap"></canvas>
+      <div id="graphStats">N:0  E:0</div>
+    </div>
+    <div id="pathSection">
+      <div class="section-label">마커 순회 (1→8)</div>
+      <div class="path-btns">
+        <button id="btnAstar">A*</button>
+        <button id="btnDijkstra">Dijkstra</button>
+        <button id="btnClearPath">✕</button>
+      </div>
+      <div id="pathInfo"></div>
+    </div>
+  </div>
+</div>
+<div id="ctrl">
+  <label>속도</label>
+  <input type="range" min="0.1" max="3" value="0.8" id="spd" step="0.1">
+  <span id="spdVal" style="font-size:13px;font-weight:500;min-width:28px;">0.8</span>
+  <label style="margin-left:8px;">줌</label>
+  <input type="range" min="1.5" max="6" value="3" id="zoom" step="0.1">
+  <span id="zoomVal" style="font-size:13px;font-weight:500;min-width:28px;">3.0×</span>
+  <button id="btn">일시정지</button>
+  <button id="shuffle">마커 섞기</button>
+  <button id="restart">다시 시작</button>
+  <button id="detBtn" class="on">검출 ON</button>
+</div>
+<div id="status">진행: 1 / 64 교차점</div>
+
+<script>
+var C=document.getElementById('c');
+var ctx=C.getContext('2d');
+var Mv=document.getElementById('minimap');
+var mctx=Mv.getContext('2d');
+var Det=document.getElementById('det');
+var dctx=Det.getContext('2d');
+var Gm=document.getElementById('gmap');
+var gctx=Gm.getContext('2d');
+var panel=document.getElementById('panel');
+var W=500,H=500,ROWS=8,COLS=8,PAD=40;
+var MW=110,MH=110,MPAD=10;
+var GM_W=180,GM_H=180,GM_PAD=16;
+
+// 고해상도 그래프맵
+var dpr=window.devicePixelRatio||1;
+Gm.width=Math.round(GM_W*dpr);
+Gm.height=Math.round(GM_H*dpr);
+Gm.style.width=GM_W+'px';
+Gm.style.height=GM_H+'px';
+gctx.scale(dpr,dpr);
+
+var cW=(W-PAD*2)/(COLS-1),cH=(H-PAD*2)/(ROWS-1);
+var mcW=(MW-MPAD*2)/(COLS-1),mcH=(MH-MPAD*2)/(ROWS-1);
+var gcW=(GM_W-GM_PAD*2)/(COLS-1),gcH=(GM_H-GM_PAD*2-14)/(ROWS-1);
+function gx(c){return PAD+c*cW;} function gy(r){return PAD+r*cH;}
+function mx(c){return MPAD+c*mcW;} function my(r){return MPAD+r*mcH;}
+function gmX(c){return GM_PAD+c*gcW;} function gmY(r){return GM_PAD+r*gcH;}
+
+// ── 그래프 데이터 ──────────────────────────────────────────────
+var gNodes={}, gEdges=[], gEdgeSet=new Set(), gVisitSeq=0;
+
+// ── 경로 추종 상태 ─────────────────────────────────────────────
+// pathWaypoints: 마커 ID 순(1→8) 정렬된 node key 배열
+var pathWaypoints=[], pathWpIdx=0, pathFollowT=0;
+var pathMode=false, pathFollowDone=false, currentPathAlgo='';
+
+function edgeKey(r1,c1,r2,c2){
+  var a=r1+','+c1, b=r2+','+c2;
+  return a<b?a+'-'+b:b+'-'+a;
+}
+function graphReset(){
+  gNodes={}; gEdges=[]; gEdgeSet=new Set(); gVisitSeq=0;
+  pathWaypoints=[]; pathWpIdx=0; pathFollowT=0;
+  pathMode=false; pathFollowDone=false; currentPathAlgo='';
+  var s=path[0];
+  gNodes[s.r+','+s.c]={r:s.r,c:s.c,markerNum:null,seq:++gVisitSeq};
+  document.getElementById('graphStats').textContent='N:1  E:0';
+  document.getElementById('pathInfo').textContent='';
+  document.getElementById('btnAstar').className='';
+  document.getElementById('btnDijkstra').className='';
+}
+function graphVisit(r,c,prevR,prevC){
+  var k=r+','+c;
+  if(!gNodes[k]) gNodes[k]={r:r,c:c,markerNum:null,seq:++gVisitSeq};
+  var ek=edgeKey(r,c,prevR,prevC);
+  if(!gEdgeSet.has(ek)){ gEdgeSet.add(ek); gEdges.push({r1:prevR,c1:prevC,r2:r,c2:c}); }
+  document.getElementById('graphStats').textContent=
+    'N:'+Object.keys(gNodes).length+'  E:'+gEdges.length;
+}
+function graphMarkNode(r,c,num){
+  var k=r+','+c;
+  if(gNodes[k]) gNodes[k].markerNum=num;
+  else gNodes[k]={r:r,c:c,markerNum:num,seq:++gVisitSeq};
+}
+
+function startPathFollow(algo){
+  // 현재 위치 노드 key
+  var curKey;
+  if(pathMode&&pathWaypoints.length>0){
+    curKey=pathWaypoints[Math.min(pathWpIdx,pathWaypoints.length-1)];
+  } else {
+    curKey=path[seg].r+','+path[seg].c;
+  }
+  if(!gNodes[curKey]){
+    var p=curKey.split(',');
+    gNodes[curKey]={r:+p[0],c:+p[1],markerNum:null,seq:++gVisitSeq};
+  }
+
+  // 현재위치 → 마커1 → 마커2 → ... → 마커8
+  var wps=[curKey];
+  for(var id=1;id<=8;id++){
+    for(var m=0;m<markers.length;m++){
+      if(mNums[m]===id){
+        var k=markers[m].r+','+markers[m].c;
+        if(k!==wps[wps.length-1]) wps.push(k);
+        break;
+      }
+    }
+  }
+  if(wps.length<2){
+    document.getElementById('pathInfo').textContent='마커 1개 이상 필요';
+    return;
+  }
+  pathWaypoints=wps;
+  pathWpIdx=0; pathFollowT=0; pathFollowDone=false;
+  pathMode=true; currentPathAlgo=algo;
+  paused=false;
+  document.getElementById('btn').textContent='일시정지';
+  document.getElementById('pathInfo').textContent=
+    (algo==='astar'?'A*':'Dijkstra')+': 현재위치 → 마커 '+(wps.length-1)+'개 순회';
+  last=null; requestAnimationFrame(loop);
+}
+
+document.getElementById('btnAstar').addEventListener('click',function(){
+  this.className='active-astar';
+  document.getElementById('btnDijkstra').className='';
+  startPathFollow('astar');
+});
+document.getElementById('btnDijkstra').addEventListener('click',function(){
+  this.className='active-dijkstra';
+  document.getElementById('btnAstar').className='';
+  startPathFollow('dijkstra');
+});
+document.getElementById('btnClearPath').addEventListener('click',function(){
+  var was=pathMode;
+  pathMode=false; pathFollowDone=false; pathWaypoints=[];
+  currentPathAlgo='';
+  document.getElementById('pathInfo').textContent='';
+  document.getElementById('btnAstar').className='';
+  document.getElementById('btnDijkstra').className='';
+  if(was&&!paused&&!done){ last=null; requestAnimationFrame(loop); }
+});
+
+// ── 마커/방문 관리 ─────────────────────────────────────────────
+function pickMarkers(){
+  var all=[];
+  for(var r=0;r<ROWS;r++) for(var c=0;c<COLS;c++) all.push({r:r,c:c});
+  all.sort(function(){return Math.random()-0.5;});
+  return all.slice(0,8);
+}
+function shuffleNums(){
+  var a=[1,2,3,4,5,6,7,8];
+  for(var i=7;i>0;i--){var j=Math.floor(Math.random()*(i+1));var t=a[i];a[i]=a[j];a[j]=t;}
+  return a;
+}
+
+var markers=pickMarkers();
+var mNums=new Array(8).fill(null);
+var pool=shuffleNums();
+var poolIdx=0;
+var visitOrder=[];
+
+function updatePanel(){
+  panel.innerHTML='';
+  for(var i=0;i<visitOrder.length;i++){
+    var num=visitOrder[i];
+    var row=document.createElement('div'); row.className='pr';
+    var idx=document.createElement('span'); idx.className='pi'; idx.textContent=(i+1)+'.';
+    var b=document.createElement('div'); b.className='pb'; b.textContent=String(num);
+    var ni=document.createElement('div'); ni.className='ni';
+    for(var m=0;m<markers.length;m++){
+      if(mNums[m]===num){
+        var n=gNodes[markers[m].r+','+markers[m].c];
+        if(n){
+          ni.innerHTML=
+            '"'+n.r+','+n.c+'"<br>'+
+            '{id:'+n.markerNum+', seq:'+n.seq+',<br>'+
+            ' r:'+n.r+', c:'+n.c+'}';
+        }
+        break;
+      }
+    }
+    row.appendChild(idx); row.appendChild(b); row.appendChild(ni);
+    panel.appendChild(row);
+  }
+}
+
+function checkMarker(r,c){
+  for(var i=0;i<markers.length;i++){
+    if(markers[i].r===r&&markers[i].c===c&&mNums[i]===null){
+      mNums[i]=pool[poolIdx]; visitOrder.push(pool[poolIdx]);
+      graphMarkNode(r,c,pool[poolIdx]);
+      poolIdx++;
+      updatePanel();
+    }
+  }
+}
+
+document.getElementById('shuffle').addEventListener('click',function(){
+  markers=pickMarkers(); mNums=new Array(8).fill(null);
+  pool=shuffleNums(); poolIdx=0; visitOrder=[]; updatePanel();
+  graphReset();
+});
+
+// ── ArUco 패턴 / 그리기 ────────────────────────────────────────
+var patterns=[
+  [[1,0,1,0],[0,1,1,0],[1,0,0,1],[0,1,0,1]],
+  [[0,1,0,1],[1,1,0,0],[0,0,1,1],[1,0,1,0]],
+  [[1,1,0,0],[0,0,1,0],[1,0,0,1],[0,1,1,1]],
+  [[0,0,1,1],[1,0,0,1],[0,1,1,0],[1,1,0,0]],
+  [[1,0,0,1],[0,1,0,1],[1,1,0,0],[0,0,1,1]],
+  [[0,1,1,0],[1,0,1,0],[0,1,0,1],[1,0,0,1]],
+  [[1,1,1,0],[0,0,1,1],[1,1,0,0],[0,1,0,1]],
+  [[0,0,0,1],[1,1,0,1],[0,1,1,0],[1,0,1,1]],
+];
+
+function drawAruco(cx,cy,idx,size){
+  var s=size,half=s/2,cs=s/6;
+  ctx.save(); ctx.translate(cx-half,cy-half);
+  ctx.fillStyle='#fff'; ctx.fillRect(0,0,s,s);
+  ctx.fillStyle='#000';
+  ctx.fillRect(0,0,s,cs); ctx.fillRect(0,s-cs,s,cs);
+  ctx.fillRect(0,0,cs,s); ctx.fillRect(s-cs,0,cs,s);
+  var pat=patterns[idx%8];
+  for(var row=0;row<4;row++) for(var col=0;col<4;col++){
+    ctx.fillStyle=pat[row][col]?'#000':'#fff';
+    ctx.fillRect(cs+col*cs,cs+row*cs,cs,cs);
+  }
+  ctx.restore();
+}
+
+function buildPath(){
+  var pts=[];
+  for(var c=0;c<COLS;c++){
+    if(c%2===0){for(var r=ROWS-1;r>=0;r--) pts.push({r:r,c:c});}
+    else{for(var r=0;r<ROWS;r++) pts.push({r:r,c:c});}
+    if(c<COLS-1){var er=c%2===0?0:ROWS-1; pts.push({r:er,c:c+1});}
+  }
+  return pts.filter(function(p,i){return i===0||(p.r!==pts[i-1].r||p.c!==pts[i-1].c);});
+}
+
+var path=buildPath();
+var seg=0,t=0,paused=false,done=false,speed=0.8,zoom=3.0;
+var camX=gx(path[0].c),camY=gy(path[0].r);
+var visited=new Set();
+visited.add(path[0].r+','+path[0].c);
+graphReset();
+checkMarker(path[0].r,path[0].c);
+
+function lerp(a,b,t){return a+(b-a)*t;}
+
+function dotPos(){
+  // 경로 추종: 현재 waypoint → 다음 waypoint 직선 비행
+  if(pathMode&&pathWaypoints.length>1){
+    if(pathFollowDone){
+      var ln=gNodes[pathWaypoints[pathWaypoints.length-1]];
+      return {x:gx(ln.c),y:gy(ln.r)};
+    }
+    var ci=Math.min(pathWpIdx,pathWaypoints.length-2);
+    var sn=gNodes[pathWaypoints[ci]];
+    var gn=gNodes[pathWaypoints[ci+1]];
+    return {x:lerp(gx(sn.c),gx(gn.c),Math.min(pathFollowT,1)),
+            y:lerp(gy(sn.r),gy(gn.r),Math.min(pathFollowT,1))};
+  }
+  // 사행 스캔
+  var cur=path[seg];
+  if(done||seg>=path.length-1) return {x:gx(cur.c),y:gy(cur.r)};
+  var nxt=path[seg+1];
+  return {x:lerp(gx(cur.c),gx(nxt.c),t),y:lerp(gy(cur.r),gy(nxt.r),t)};
+}
+
+function resetState(){
+  seg=0;t=0;done=false;paused=false;
+  pathMode=false; pathFollowDone=false; pathWaypoints=[];
+  pathWpIdx=0; pathFollowT=0; currentPathAlgo='';
+  visited.clear(); visited.add(path[0].r+','+path[0].c);
+  mNums=new Array(8).fill(null); pool=shuffleNums(); poolIdx=0; visitOrder=[]; updatePanel();
+  graphReset();
+  checkMarker(path[0].r,path[0].c);
+  camX=gx(path[0].c); camY=gy(path[0].r);
+  document.getElementById('status').textContent='진행: 1 / 64 교차점';
+  document.getElementById('btn').textContent='일시정지';
+}
+
+document.getElementById('spd').addEventListener('input',function(e){speed=+e.target.value;document.getElementById('spdVal').textContent=speed.toFixed(1);});
+document.getElementById('zoom').addEventListener('input',function(e){zoom=+e.target.value;document.getElementById('zoomVal').textContent=zoom.toFixed(1)+'×';});
+document.getElementById('btn').addEventListener('click',function(){
+  if(pathFollowDone){ pathMode=false; pathFollowDone=false; pathWaypoints=[]; }
+  if(done&&!pathMode) return;
+  paused=!paused;
+  document.getElementById('btn').textContent=paused?'재생':'일시정지';
+  if(!paused){last=null;requestAnimationFrame(loop);}
+});
+document.getElementById('restart').addEventListener('click',function(){resetState();last=null;requestAnimationFrame(loop);});
+
+// ── 미니맵 ────────────────────────────────────────────────────
+function drawMini(dx,dy){
+  mctx.clearRect(0,0,MW,MH);
+  mctx.fillStyle='rgba(0,0,0,0.6)'; mctx.fillRect(0,0,MW,MH);
+  mctx.strokeStyle='rgba(255,255,255,0.35)'; mctx.lineWidth=0.5;
+  for(var r=0;r<ROWS;r++){mctx.beginPath();mctx.moveTo(mx(0),my(r));mctx.lineTo(mx(COLS-1),my(r));mctx.stroke();}
+  for(var c=0;c<COLS;c++){mctx.beginPath();mctx.moveTo(mx(c),my(0));mctx.lineTo(mx(c),my(ROWS-1));mctx.stroke();}
+  for(var i=0;i<markers.length;i++){
+    mctx.fillStyle=mNums[i]!==null?'rgba(220,50,50,0.9)':'rgba(255,255,255,0.8)';
+    mctx.fillRect(mx(markers[i].c)-3,my(markers[i].r)-3,6,6);
+  }
+  for(var i=0;i<=seg&&i<path.length;i++){
+    mctx.beginPath();mctx.arc(mx(path[i].c),my(path[i].r),1.5,0,Math.PI*2);
+    mctx.fillStyle='rgba(100,200,255,0.7)';mctx.fill();
+  }
+  var vW=W/zoom,vH=H/zoom;
+  var sx=(MW-MPAD*2)/(W-PAD*2),sy=(MH-MPAD*2)/(H-PAD*2);
+  mctx.strokeStyle='rgba(255,210,40,0.9)'; mctx.lineWidth=1;
+  mctx.strokeRect(MPAD+(camX-vW/2-PAD)*sx,MPAD+(camY-vH/2-PAD)*sy,vW*sx,vH*sy);
+  mctx.beginPath();mctx.arc(MPAD+(dx-PAD)*sx,MPAD+(dy-PAD)*sy,3,0,Math.PI*2);
+  mctx.fillStyle=done?'#20C020':'#E02020';mctx.fill();
+}
+
+function draw(){
+  var d=dotPos(); var dx=d.x,dy=d.y;
+  camX=lerp(camX,dx,0.08); camY=lerp(camY,dy,0.08);
+  ctx.fillStyle='#fff'; ctx.fillRect(0,0,W,H);
+  ctx.save();
+  ctx.translate(W/2,H/2); ctx.scale(zoom,zoom); ctx.translate(-camX,-camY);
+  ctx.strokeStyle='rgba(0,0,0,0.88)'; ctx.lineWidth=3; ctx.lineCap='round';
+  for(var r=0;r<ROWS;r++){ctx.beginPath();ctx.moveTo(gx(0),gy(r));ctx.lineTo(gx(COLS-1),gy(r));ctx.stroke();}
+  for(var c=0;c<COLS;c++){ctx.beginPath();ctx.moveTo(gx(c),gy(0));ctx.lineTo(gx(c),gy(ROWS-1));ctx.stroke();}
+  var ms=cW*0.5;
+  for(var i=0;i<markers.length;i++) drawAruco(gx(markers[i].c),gy(markers[i].r),i,ms);
+  ctx.beginPath(); ctx.arc(dx,dy,5,0,Math.PI*2);
+  ctx.fillStyle=pathMode?(pathFollowDone?'#20C020':'#ff9900'):(done?'#20C020':'#E02020');
+  ctx.fill();
+  ctx.restore();
+  drawMini(dx,dy);
+}
+
+// ── 선 검출 ────────────────────────────────────────────────────
+var showDet=true;
+document.getElementById('detBtn').addEventListener('click',function(){
+  showDet=!showDet;
+  this.textContent=showDet?'검출 ON':'검출 OFF';
+  this.className=showDet?'on':'';
+});
+function toScreen(wx,wy){return {x:(wx-camX)*zoom+W/2,y:(wy-camY)*zoom+H/2};}
+function buildMask(data){
+  var mask=new Uint8Array(W*H);
+  for(var i=0;i<W*H;i++){var r=data[i*4],g=data[i*4+1],b=data[i*4+2];if((r+g+b)<240)mask[i]=1;}
+  return mask;
+}
+function excludeMarkers(mask){
+  var halfMs=(cW*0.5/2)*zoom+6;
+  for(var m=0;m<markers.length;m++){
+    var sp=toScreen(gx(markers[m].c),gy(markers[m].r));
+    var x1=Math.max(0,Math.floor(sp.x-halfMs)),y1=Math.max(0,Math.floor(sp.y-halfMs));
+    var x2=Math.min(W,Math.ceil(sp.x+halfMs)),y2=Math.min(H,Math.ceil(sp.y+halfMs));
+    for(var row=y1;row<y2;row++) for(var col=x1;col<x2;col++) mask[row*W+col]=0;
+  }
+}
+function scanH(mask,minLen){
+  var segs=[];
+  for(var row=0;row<H;row++){var s=-1;for(var col=0;col<=W;col++){var d=col<W?mask[row*W+col]:0;if(d&&s<0)s=col;else if(!d&&s>=0){if(col-s>=minLen)segs.push({x1:s,y:row,x2:col-1});s=-1;}}}
+  return segs;
+}
+function scanV(mask,minLen){
+  var segs=[];
+  for(var col=0;col<W;col++){var s=-1;for(var row=0;row<=H;row++){var d=row<H?mask[row*W+col]:0;if(d&&s<0)s=row;else if(!d&&s>=0){if(row-s>=minLen)segs.push({x:col,y1:s,y2:row-1});s=-1;}}}
+  return segs;
+}
+function mergeH(segs,gap){
+  if(!segs.length)return[];
+  segs.sort(function(a,b){return a.y-b.y;});
+  var groups=[{cy:segs[0].y,segs:[segs[0]]}];
+  for(var i=1;i<segs.length;i++){var last=groups[groups.length-1];if(Math.abs(segs[i].y-last.cy)<=gap){last.segs.push(segs[i]);last.cy=last.segs.reduce(function(s,l){return s+l.y;},0)/last.segs.length;}else groups.push({cy:segs[i].y,segs:[segs[i]]});}
+  return groups.map(function(g){return{x1:Math.min.apply(null,g.segs.map(function(s){return s.x1;})),y:Math.round(g.cy),x2:Math.max.apply(null,g.segs.map(function(s){return s.x2;}))};});
+}
+function mergeV(segs,gap){
+  if(!segs.length)return[];
+  segs.sort(function(a,b){return a.x-b.x;});
+  var groups=[{cx:segs[0].x,segs:[segs[0]]}];
+  for(var i=1;i<segs.length;i++){var last=groups[groups.length-1];if(Math.abs(segs[i].x-last.cx)<=gap){last.segs.push(segs[i]);last.cx=last.segs.reduce(function(s,l){return s+l.x;},0)/last.segs.length;}else groups.push({cx:segs[i].x,segs:[segs[i]]});}
+  return groups.map(function(g){return{x:Math.round(g.cx),y1:Math.min.apply(null,g.segs.map(function(s){return s.y1;})),y2:Math.max.apply(null,g.segs.map(function(s){return s.y2;}))};});
+}
+function findIntersections(hLines,vLines){
+  var pts=[],m=8;
+  for(var i=0;i<hLines.length;i++)for(var j=0;j<vLines.length;j++){var h=hLines[i],v=vLines[j];if(v.x>=h.x1-m&&v.x<=h.x2+m&&h.y>=v.y1-m&&h.y<=v.y2+m)pts.push({x:v.x,y:h.y});}
+  return pts;
+}
+function calcErrors(vLines){
+  if(!vLines.length)return null;
+  var nearest=vLines.reduce(function(a,b){return Math.abs(a.x-W/2)<Math.abs(b.x-W/2)?a:b;});
+  return Math.round(nearest.x-W/2);
+}
+
+// ── 그래프 오버레이 ────────────────────────────────────────────
+function drawGraphOverlay(){
+  var pc=currentPathAlgo==='astar'?'rgba(26,106,255,0.95)':'rgba(224,96,0,0.95)';
+
+  // 웨이포인트 경로 시각화
+  if(pathWaypoints.length>1){
+    for(var i=0;i<pathWaypoints.length-1;i++){
+      var n1=gNodes[pathWaypoints[i]], n2=gNodes[pathWaypoints[i+1]];
+      if(!n1||!n2) continue;
+      var p1=toScreen(gx(n1.c),gy(n1.r)), p2=toScreen(gx(n2.c),gy(n2.r));
+      var isCur=pathMode&&!pathFollowDone&&i===pathWpIdx;
+      dctx.strokeStyle=isCur?pc:'rgba(160,160,160,0.5)';
+      dctx.lineWidth=isCur?5:2;
+      dctx.setLineDash(isCur?[10,4]:[6,4]);
+      dctx.beginPath(); dctx.moveTo(p1.x,p1.y); dctx.lineTo(p2.x,p2.y); dctx.stroke();
+    }
+    dctx.setLineDash([]);
+    // 웨이포인트 원
+    for(var i=0;i<pathWaypoints.length;i++){
+      var n=gNodes[pathWaypoints[i]]; if(!n) continue;
+      var sp=toScreen(gx(n.c),gy(n.r));
+      var isDone=pathMode&&i<pathWpIdx;
+      var isCur=pathMode&&!pathFollowDone&&i===pathWpIdx;
+      dctx.beginPath(); dctx.arc(sp.x,sp.y,12,0,Math.PI*2);
+      dctx.fillStyle=isDone?'#20c020':(isCur?pc:'rgba(120,120,120,0.7)');
+      dctx.fill();
+      dctx.strokeStyle='#fff'; dctx.lineWidth=2; dctx.stroke();
+      dctx.fillStyle='#fff'; dctx.font='bold 11px monospace';
+      dctx.textAlign='center'; dctx.textBaseline='middle';
+      dctx.fillText(String(n.markerNum),sp.x,sp.y);
+    }
+    dctx.textAlign='left'; dctx.textBaseline='alphabetic';
+  }
+
+  // 그래프 엣지
+  dctx.strokeStyle='rgba(0,160,255,0.55)'; dctx.lineWidth=2;
+  for(var i=0;i<gEdges.length;i++){
+    var e=gEdges[i];
+    var p1=toScreen(gx(e.c1),gy(e.r1)), p2=toScreen(gx(e.c2),gy(e.r2));
+    dctx.beginPath(); dctx.moveTo(p1.x,p1.y); dctx.lineTo(p2.x,p2.y); dctx.stroke();
+  }
+  // 그래프 노드
+  var keys=Object.keys(gNodes);
+  for(var i=0;i<keys.length;i++){
+    var n=gNodes[keys[i]];
+    var sp=toScreen(gx(n.c),gy(n.r));
+    var isMarker=n.markerNum!==null;
+    var nr=isMarker?10:7;
+    dctx.beginPath(); dctx.arc(sp.x,sp.y,nr,0,Math.PI*2);
+    dctx.fillStyle=isMarker?'#dd2020':'#0099ff'; dctx.fill();
+    dctx.strokeStyle='#fff'; dctx.lineWidth=1.5; dctx.stroke();
+    dctx.fillStyle='#fff';
+    dctx.font='bold '+(isMarker?'11':'9')+'px monospace';
+    dctx.textAlign='center'; dctx.textBaseline='middle';
+    dctx.fillText(isMarker?String(n.markerNum):String(n.seq),sp.x,sp.y);
+  }
+  dctx.textAlign='left'; dctx.textBaseline='alphabetic';
+}
+
+// ── Graph Map ──────────────────────────────────────────────────
+function drawGraphMap(){
+  gctx.clearRect(0,0,GM_W,GM_H);
+  gctx.fillStyle='#fff'; gctx.fillRect(0,0,GM_W,GM_H);
+
+  // 미발견 ghost
+  for(var r=0;r<ROWS;r++) for(var c=0;c<COLS;c++){
+    if(!gNodes[r+','+c]){
+      gctx.beginPath(); gctx.arc(gmX(c),gmY(r),1.2,0,Math.PI*2);
+      gctx.fillStyle='rgba(0,0,0,0.12)'; gctx.fill();
+    }
+  }
+  // 엣지
+  gctx.strokeStyle='#0099ff'; gctx.lineWidth=1.5;
+  for(var i=0;i<gEdges.length;i++){
+    var e=gEdges[i];
+    gctx.beginPath(); gctx.moveTo(gmX(e.c1),gmY(e.r1)); gctx.lineTo(gmX(e.c2),gmY(e.r2)); gctx.stroke();
+  }
+  // 웨이포인트 경로
+  if(pathWaypoints.length>1){
+    var pc=currentPathAlgo==='astar'?'#1a6aff':'#e06000';
+    for(var i=0;i<pathWaypoints.length-1;i++){
+      var n1=gNodes[pathWaypoints[i]], n2=gNodes[pathWaypoints[i+1]];
+      if(!n1||!n2) continue;
+      var isCur=pathMode&&!pathFollowDone&&i===pathWpIdx;
+      gctx.strokeStyle=isCur?pc:'rgba(150,150,150,0.5)';
+      gctx.lineWidth=isCur?2.5:1.2;
+      gctx.setLineDash(isCur?[4,2]:[3,2]);
+      gctx.beginPath(); gctx.moveTo(gmX(n1.c),gmY(n1.r)); gctx.lineTo(gmX(n2.c),gmY(n2.r)); gctx.stroke();
+    }
+    gctx.setLineDash([]);
+  }
+  // 노드
+  var keys=Object.keys(gNodes);
+  for(var i=0;i<keys.length;i++){
+    var n=gNodes[keys[i]];
+    var isMarker=n.markerNum!==null;
+    var nx=gmX(n.c), ny=gmY(n.r), nr=isMarker?7:5;
+    gctx.beginPath(); gctx.arc(nx,ny,nr,0,Math.PI*2);
+    gctx.fillStyle=isMarker?'#dd2020':'#0099ff'; gctx.fill();
+    gctx.strokeStyle='#fff'; gctx.lineWidth=1; gctx.stroke();
+    gctx.fillStyle='#fff';
+    gctx.font='bold '+(isMarker?'7':'6')+'px monospace';
+    gctx.textAlign='center'; gctx.textBaseline='middle';
+    gctx.fillText(isMarker?String(n.markerNum):String(n.seq),nx,ny);
+  }
+  gctx.textAlign='left'; gctx.textBaseline='alphabetic';
+
+  // 현재 위치
+  var dp=dotPos();
+  var dpgx=GM_PAD+(dp.x-PAD)/cW*gcW;
+  var dpgy=GM_PAD+(dp.y-PAD)/cH*gcH;
+  gctx.beginPath(); gctx.arc(dpgx,dpgy,4,0,Math.PI*2);
+  gctx.fillStyle=pathFollowDone?'#20c020':(pathMode?'#ff9900':(done?'#20c020':'#E02020'));
+  gctx.fill();
+  gctx.strokeStyle='#fff'; gctx.lineWidth=1.2; gctx.stroke();
+
+  // 범례
+  var ly=GM_H-5;
+  gctx.font='7.5px monospace';
+  gctx.fillStyle='#0099ff'; gctx.beginPath(); gctx.arc(7,ly-4,4,0,Math.PI*2); gctx.fill();
+  gctx.fillStyle='#555'; gctx.fillText('노드',13,ly);
+  gctx.fillStyle='#dd2020'; gctx.beginPath(); gctx.arc(50,ly-4,4,0,Math.PI*2); gctx.fill();
+  gctx.fillStyle='#555'; gctx.fillText('마커',56,ly);
+  gctx.fillStyle='#E02020'; gctx.beginPath(); gctx.arc(93,ly-4,3.5,0,Math.PI*2); gctx.fill();
+  gctx.fillStyle='#555'; gctx.fillText('현재',99,ly);
+  gctx.fillStyle='rgba(0,0,0,0.12)'; gctx.beginPath(); gctx.arc(136,ly-4,3,0,Math.PI*2); gctx.fill();
+  gctx.fillStyle='#aaa'; gctx.fillText('미발견',141,ly);
+}
+
+function detectAndDraw(){
+  dctx.clearRect(0,0,W,H);
+  if(showDet){
+    var imgData=ctx.getImageData(0,0,W,H);
+    var mask=buildMask(imgData.data);
+    excludeMarkers(mask);
+    var minLen=Math.max(15,Math.round(3*zoom*0.4));
+    var hSegs=scanH(mask,minLen), vSegs=scanV(mask,minLen);
+    var gap=Math.max(4,Math.round(3*zoom*0.6));
+    var hLines=mergeH(hSegs,gap), vLines=mergeV(vSegs,gap);
+    var intersections=findIntersections(hLines,vLines);
+    var cxErr=calcErrors(vLines);
+    dctx.lineWidth=2;
+    dctx.strokeStyle='rgba(30,120,255,0.75)';
+    for(var i=0;i<hLines.length;i++){var h=hLines[i];dctx.beginPath();dctx.moveTo(h.x1,h.y);dctx.lineTo(h.x2,h.y);dctx.stroke();}
+    dctx.strokeStyle='rgba(255,130,0,0.85)';
+    for(var i=0;i<vLines.length;i++){var v=vLines[i];dctx.beginPath();dctx.moveTo(v.x,v.y1);dctx.lineTo(v.x,v.y2);dctx.stroke();}
+    for(var i=0;i<intersections.length;i++){
+      var pt=intersections[i];
+      dctx.beginPath();dctx.arc(pt.x,pt.y,5,0,Math.PI*2);
+      dctx.fillStyle='rgba(0,220,220,0.9)';dctx.fill();
+      dctx.strokeStyle='#000';dctx.lineWidth=1;dctx.stroke();
+    }
+    var halfMs=(cW*0.5/2)*zoom+6;
+    for(var m=0;m<markers.length;m++){
+      var sp=toScreen(gx(markers[m].c),gy(markers[m].r));
+      dctx.strokeStyle='rgba(220,50,50,0.5)';dctx.lineWidth=1;dctx.setLineDash([3,3]);
+      dctx.strokeRect(sp.x-halfMs,sp.y-halfMs,halfMs*2,halfMs*2);dctx.setLineDash([]);
+    }
+    var hudLines=['H:'+hLines.length+'  V:'+vLines.length,'교차점: '+intersections.length,'cx_err: '+(cxErr!==null?cxErr+'px':'N/A')];
+    dctx.font='bold 12px monospace';
+    for(var i=0;i<hudLines.length;i++){
+      var tw=dctx.measureText(hudLines[i]).width,ty=H-6-i*20;
+      dctx.fillStyle='rgba(0,0,0,0.55)';dctx.fillRect(W-tw-14,ty-14,tw+10,17);
+      dctx.fillStyle='#fff';dctx.fillText(hudLines[i],W-tw-9,ty);
+    }
+  }
+  drawGraphOverlay();
+}
+
+var last=null;
+function loop(ts){
+  if(!last) last=ts;
+  var dt=(ts-last)/1000; last=ts;
+
+  if(!paused){
+    // 경로 추종: 웨이포인트 사이 직선 비행
+    if(pathMode&&pathWaypoints.length>1&&!pathFollowDone){
+      var sn=gNodes[pathWaypoints[pathWpIdx]];
+      var gn=gNodes[pathWaypoints[pathWpIdx+1]];
+      if(sn&&gn){
+        var sl=Math.hypot(gx(gn.c)-gx(sn.c),gy(gn.r)-gy(sn.r));
+        if(sl>0) pathFollowT+=(speed*50)/sl*dt;
+        if(pathFollowT>=1){
+          pathFollowT=0; pathWpIdx++;
+          if(pathWpIdx>=pathWaypoints.length-1){
+            pathFollowDone=true;
+            var algo=currentPathAlgo==='astar'?'A*':'Dijkstra';
+            document.getElementById('pathInfo').textContent=
+              algo+' 완료! 전체 마커 순회 (재생 → 스캔 복귀)';
+          } else {
+            document.getElementById('pathInfo').textContent=
+              (currentPathAlgo==='astar'?'A*':'Dijkstra')+
+              ': 마커 '+(pathWpIdx+1)+'/'+pathWaypoints.length+' 이동중...';
+          }
+        }
+      }
+    }
+    // 사행 스캔
+    else if(!pathMode&&!done){
+      if(seg>=path.length-1){
+        t=0;done=true;
+        document.getElementById('status').textContent='완료! 모든 64개 교차점 방문 ✓';
+        document.getElementById('btn').textContent='완료';
+      } else {
+        var cur=path[seg],nxt=path[seg+1];
+        var sl=Math.hypot(gx(nxt.c)-gx(cur.c),gy(nxt.r)-gy(cur.r));
+        if(sl>0) t+=(speed*50)/sl*dt;
+        if(t>=1){
+          t=0;
+          var prevSeg=seg; seg++;
+          visited.add(path[seg].r+','+path[seg].c);
+          graphVisit(path[seg].r,path[seg].c,path[prevSeg].r,path[prevSeg].c);
+          checkMarker(path[seg].r,path[seg].c);
+          document.getElementById('status').textContent='진행: '+visited.size+' / 64 교차점';
+        }
+      }
+    }
+  }
+
+  draw();
+  detectAndDraw();
+  drawGraphMap();
+
+  var keepGoing=!paused&&((pathMode&&!pathFollowDone)||(!pathMode&&!done));
+  if(keepGoing) requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
